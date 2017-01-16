@@ -32,6 +32,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <termios.h>
+#include <unistd.h>
 
 #include "portable.h"
 #include "dfu.h"
@@ -183,6 +185,8 @@ static void help(void)
 		"  -D --download <file>\t\tWrite firmware from <file> into device\n"
 		"  -R --reset\t\t\tIssue USB Reset signalling once we're finished\n"
 	    "  -r --reset-stm32\t\t\tFollow STM32 DFU reset procedures to start firmware\n"
+	    "  -w --probe-timeout <sec>\t\t\tWait <sec> seconds for device\n"
+	    "  -W --wiieva-port <tty_dev>\t\t\tTry enter wiieva board to DFU mode\n"
 		"  -s --dfuse-address <address>\tST DfuSe mode, specify target address for\n"
 		"\t\t\t\traw file download or upload. Not applicable for\n"
 		"\t\t\t\tDfuSe file (.dfu) downloads\n"
@@ -222,8 +226,48 @@ static struct option opts[] = {
 	{ "reset", 0, 0, 'R' },
 	{ "dfuse-address", 1, 0, 's' },
 	{ "reset-stm32", 0, 0, 'r' },
+	{ "probe-timeout", 1, 0, 'w' },
+	{ "wiieva-port", 1, 0, 'W' },
 	{ 0, 0, 0, 0 }
 };
+
+
+const char wiieva_dfu_magic[] = "!DfU!"; 
+static int wiieva_switch_to_dfu (const char *serial_port) {
+
+	struct termios tio;
+    memset(&tio,0,sizeof(tio));
+	tio.c_cflag=CS8|CREAD|CLOCAL;           // 8n1, see termios.h for more information
+	tio.c_cc[VMIN]=1;
+	tio.c_cc[VTIME]=5;
+
+	printf ("Trying to enter wiieva board on %s to DFU mode\n",serial_port);
+	int tty_fd = open(serial_port, O_RDWR | O_NONBLOCK);
+	if (tty_fd < 0) {
+		fprintf (stderr,"Can't open port %s\n",serial_port);
+		return -1;
+	}
+	cfsetospeed(&tio,B115200);            // 115200 baud
+	cfsetispeed(&tio,B115200);            // 115200 baud
+	tcsetattr(tty_fd,TCSANOW,&tio);
+
+	int opts = fcntl(tty_fd,F_GETFL);
+    if (opts < 0) {
+        perror("fcntl(F_GETFL)");
+		return -1;
+    }
+    if (fcntl(tty_fd,F_SETFL,opts & ~O_NONBLOCK) < 0) {
+        perror("fcntl(F_SETFL)");
+		return -1;
+    }
+
+	if (write (tty_fd,wiieva_dfu_magic,sizeof(wiieva_dfu_magic)) != sizeof(wiieva_dfu_magic)) {
+		perror ("write");
+		return -1;
+	}
+	close (tty_fd);
+	return 0;
+}
 
 int main(int argc, char **argv)
 {
@@ -234,12 +278,14 @@ int main(int argc, char **argv)
 	libusb_context *ctx;
 	struct dfu_file file;
 	char *end;
-	int final_reset = 0;
+	int final_reset = 0,final_stm32reset=0;
 	int ret;
 	int dfuse_device = 0;
 	int fd;
 	const char *dfuse_options = NULL;
 	int detach_delay = 5;
+	int probe_timeout = 0;
+	const char *wiieva_serial_port = NULL;
 	uint16_t runtime_vendor;
 	uint16_t runtime_product;
 
@@ -250,7 +296,7 @@ int main(int argc, char **argv)
 
 	while (1) {
 		int c, option_index = 0;
-		c = getopt_long(argc, argv, "hVvleE:d:p:c:i:a:S:t:U:D:Rs:Z:", opts,
+		c = getopt_long(argc, argv, "hVvrleE:d:p:c:i:a:S:t:U:D:Rs:Z:w:W:", opts,
 				&option_index);
 		if (c == -1)
 			break;
@@ -321,7 +367,13 @@ int main(int argc, char **argv)
 			final_reset = 1;
 			break;
 		case 'r':
-			mode = MODE_RESET_STM32;
+			final_stm32reset = 1;
+			break;
+		case 'w':
+			probe_timeout = parse_number ("probe_timeout",optarg);
+			break;
+		case 'W':
+			wiieva_serial_port = optarg;
 			break;
 		case 's':
 			dfuse_options = optarg;
@@ -369,7 +421,18 @@ int main(int argc, char **argv)
 		libusb_set_debug(ctx, 255);
 	}
 
-	probe_devices(ctx);
+	if (wiieva_serial_port != NULL && wiieva_switch_to_dfu (wiieva_serial_port)) {
+		printf("Warning: Unable switch wiieva to DFU");
+	}
+
+	for (;;) {
+		probe_devices(ctx);
+		if (dfu_root != NULL || !probe_timeout)
+			break;
+		printf ("\rWaiting %d seconds for DFU capable device...%s",probe_timeout,probe_timeout==0?"\n":" ");
+		sleep (1);
+		probe_timeout--;
+	};
 
 	if (mode == MODE_LIST) {
 		list_dfu_interfaces();
@@ -670,7 +733,12 @@ status_again:
 			warnx("can't detach");
 		}
 		break;
-	case MODE_RESET_STM32:
+	default:
+		errx(EX_IOERR, "Unsupported mode: %u", mode);
+		break;
+	}
+
+	if (final_stm32reset) {
 		//ST Application Note 3156 Documents how to reset an STM32 out of DFU mode and into firmware mode
 		//Basicly, send the target vector reset address, then a zero-length download command, then by a get status command.
 
@@ -699,12 +767,7 @@ status_again:
 		} else {
 			printf("Successfully reset STM32\n");
 		}
-		break;
-	default:
-		errx(EX_IOERR, "Unsupported mode: %u", mode);
-		break;
 	}
-
 	if (final_reset) {
 		if (dfu_detach(dfu_root->dev_handle, dfu_root->interface, 1000) < 0) {
 			/* Even if detach failed, just carry on to leave the
